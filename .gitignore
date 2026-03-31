@@ -11,3 +11,6 @@ build/
 *.log
 /tmp/
 test-output/
+turboquant.pdf
+.DS_Store
+turboquant/codebooks/codebook_d768_b3.json

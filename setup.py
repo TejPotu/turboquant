@@ -19,6 +19,7 @@ setup(
     extras_require={
         "vllm": ["vllm>=0.16"],
         "triton": ["triton>=3.0"],
+        "mlx": ["mlx>=0.20", "mlx-lm>=0.20"],
         "test": ["pytest"],
     },
     classifiers=[
