@@ -70,13 +70,23 @@ class CompressedKVStore:
         key_q = self.quantizer.quantize(k)
         val_q = quantize_values(v, bits=self.value_bits, group_size=self.value_group_size)
 
+        # Force evaluation to sever lazy graph references to input arrays,
+        # allowing the original FP16 key/value tensors to be freed
+        mx.eval(key_q.mse_indices, key_q.qjl_signs,
+                key_q.residual_norms, key_q.norms,
+                val_q.data, val_q.scales, val_q.zeros)
+
         self._key_chunks.append(key_q)
         self._value_chunks.append(val_q)
         self._chunk_lengths.append(chunk_len)
         self._flat = None
 
     def get_flat_cache(self) -> Optional[FlatCache]:
-        """Return a flattened view of all compressed tokens. Cached until next write."""
+        """Return a flattened view of all compressed tokens. Cached until next write.
+
+        Also compacts internal chunk lists to a single entry to reduce
+        MLX array object overhead (many small arrays → few large ones).
+        """
         if not self._key_chunks:
             return None
 
@@ -89,6 +99,13 @@ class CompressedKVStore:
         else:
             flat_kq = _concat_prod_q([_flatten_prod_q(c) for c in self._key_chunks])
             flat_vq = _concat_value_q([_flatten_value_q(c) for c in self._value_chunks])
+
+            # Compact: replace many small chunks with one merged chunk
+            # to reduce MLX array object overhead
+            total = self.num_tokens
+            self._key_chunks = [_unflatten_prod_q(flat_kq)]
+            self._value_chunks = [_unflatten_value_q(flat_vq)]
+            self._chunk_lengths = [total]
 
         self._flat = FlatCache(
             prod_q=flat_kq,
@@ -136,6 +153,28 @@ def _flatten_value_q(vq: ValueQuantized) -> ValueQuantized:
         data=vq.data.reshape(-1, vq.data.shape[-2], vq.data.shape[-1]),
         scales=vq.scales.reshape(-1, vq.scales.shape[-2], vq.scales.shape[-1]),
         zeros=vq.zeros.reshape(-1, vq.zeros.shape[-2], vq.zeros.shape[-1]),
+        bits=v_bits,
+    )
+
+
+def _unflatten_prod_q(pq: ProdQuantized) -> ProdQuantized:
+    """Add batch dim back: (H, T, ...) -> (1, H, T, ...)."""
+    return ProdQuantized(
+        mse_indices=mx.expand_dims(pq.mse_indices, axis=0),
+        qjl_signs=mx.expand_dims(pq.qjl_signs, axis=0),
+        residual_norms=mx.expand_dims(pq.residual_norms, axis=0),
+        norms=mx.expand_dims(pq.norms, axis=0),
+        mse_bits=pq.mse_bits,
+    )
+
+
+def _unflatten_value_q(vq: ValueQuantized) -> ValueQuantized:
+    """Add batch dim back: (H, T, ...) -> (1, H, T, ...)."""
+    v_bits = vq.bits if len(vq) > 3 else 2
+    return ValueQuantized(
+        data=mx.expand_dims(vq.data, axis=0),
+        scales=mx.expand_dims(vq.scales, axis=0),
+        zeros=mx.expand_dims(vq.zeros, axis=0),
         bits=v_bits,
     )
 

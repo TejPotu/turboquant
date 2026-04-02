@@ -135,6 +135,59 @@ Honest assessment of claims (see `audit_claims.py` for full data):
 | "200k context works" | **Unverified** -- didn't crash, but output quality never checked |
 | "2x context on dense model" | **True** -- measured 30 GB freed on Qwen3.5-27B with 4x RTX 3090 |
 
+### Apple Silicon (MLX) -- Qwen2.5-3B-Instruct-4bit on M3 Pro (18GB)
+
+**Setup**: Apple M3 Pro, 18GB unified memory, MLX 0.22, mlx-lm, `buffer_size=64`, 3-bit keys, 4-bit values.
+
+TurboQuant has been ported to Apple's MLX framework, replacing Triton kernels with pure MLX array operations. The port includes a **chunked fused decode** path that processes compressed KV history using online softmax — never materializing the full dequantized KV cache — achieving real memory savings with minimal speed overhead.
+
+| Metric | 512 tokens | 2048 tokens |
+|--------|-----------|-------------|
+| Baseline KV overhead | 27.3 MB | 81.0 MB |
+| TurboQuant KV overhead | 11.4 MB | 26.4 MB |
+| **KV compression** | **2.4x** | **3.1x** |
+| Baseline speed | 61.8 tok/s | 60.6 tok/s |
+| TurboQuant speed | 57.1 tok/s | 56.8 tok/s |
+| **Speed retained** | **92%** | **94%** |
+| Peak memory saved | — | **85 MB** |
+| Output quality | Identical | Identical |
+
+Compression ratio improves with sequence length as the fixed-size buffer becomes a smaller fraction of total KV.
+
+#### MLX Usage
+
+```python
+from mlx_lm import load
+from mlx_lm.generate import generate_step
+from turboquant.mlx.integration import install_turboquant
+
+model, tokenizer = load("mlx-community/Qwen2.5-3B-Instruct-4bit")
+caches = install_turboquant(model, key_bits=3, value_bits=4, buffer_size=64)
+
+prompt = mx.array(tokenizer.encode("Hello, world!"))
+for token, _ in generate_step(prompt, model, max_tokens=512, prompt_cache=caches):
+    print(tokenizer.decode([token]), end="", flush=True)
+```
+
+```bash
+# Run MLX benchmark
+python benchmark_mlx.py --max-tokens 2048
+python benchmark_mlx.py --model mlx-community/Qwen3-4B --buffer-size 128
+```
+
+#### MLX Design
+
+- **Monkey-patched attention**: `install_turboquant()` patches each layer's `Attention.__call__` to route decode steps with compressed history through the fused path, while prefill and early decode use standard SDPA.
+- **Chunked fused decode**: Online softmax over compressed chunks (default 64 tokens) — O(chunk_size × D) working memory per head instead of O(N × D).
+- **Lazy eval hygiene**: `mx.eval()` after quantization in `append_chunk()` severs the computation graph, preventing the lazy evaluator from retaining FP16 source tensors.
+- **Chunk compaction**: `CompressedKVStore` merges small chunks into a single flat array on read, reducing MLX array object overhead.
+
+#### MLX Limitations
+
+- **head_dim >= 128 required**: Models with head_dim=64 (e.g., 0.5B Qwen) have ~50% relative quantization error at 3-bit. Use buffer_size larger than expected context to avoid compression on small models.
+- **No Metal shaders yet**: All ops are pure MLX array operations. Custom Metal kernels could further improve throughput.
+- **Single-batch only**: Current implementation assumes B=1 (standard for local inference on Apple Silicon).
+
 ## How It Works
 
 TurboQuant compresses KV cache entries using:
@@ -162,26 +215,26 @@ turboquant/
   triton_kernels.py    # 3 fused Triton kernels for decode attention
   vllm_attn_backend.py # Thin shim delegating to integration/vllm.py
 
-validate_paper.py      # 9 tests validating Theorems 1-3
-audit_claims.py        # Adversarial audit of all claims
-test_modular.py        # 19 modular architecture tests
-test_turboquant.py     # 7 core quantizer tests
-proof.py               # A/B benchmark (baseline vs TQ)
+  mlx/                 # Apple Silicon (MLX) port
+    codebook.py        # Codebook loading → mx.array
+    rotation.py        # Rotation/QJL matrices (numpy QR → mx.array)
+    quantizer.py       # TurboQuantMSE + TurboQuantProd (pure MLX)
+    kv_cache.py        # Value quantization with MLX bitwise ops
+    ops.py             # MLX replacements for Triton kernels + chunked fused decode
+    store.py           # CompressedKVStore with chunk compaction
+    capture.py         # RingBuffer + KVCaptureEngine
+    score.py           # Hybrid attention with GQA support
+    integration.py     # TurboQuantCache, install_turboquant(), attention monkey-patching
 
-# Profiling scripts (8x RTX 3090 MoE validation)
-validate_moe.py        # Baseline measurements via vLLM API
-validate_moe_phase2.py # TQ quality on real GPU with head_dim=256
-validate_moe_phase3.py # Logprobs, multi-needle, reasoning at max context
-profile_100k.py        # Full profiling at 1k-131k context
-profile_large.py       # Large context (64k-131k) with file-based payloads
-baseline_vs_tq.py      # VRAM comparison: baseline bf16 vs TQ compressed
-baseline_vs_tq_v2.py   # Block-level measurement during inference
+benchmark_mlx.py       # MLX benchmark (baseline vs TurboQuant on Apple Silicon)
 ```
 
 ## Usage
 
 ```bash
 pip install -e .
+
+# --- CUDA (vLLM, requires NVIDIA GPU) ---
 
 # Run paper validation (CPU, no GPU needed)
 python validate_paper.py
@@ -194,6 +247,15 @@ python -m pytest test_modular.py -v
 
 # Run proof benchmark (requires 4x RTX 3090 + Qwen3.5-27B-AWQ)
 CUDA_VISIBLE_DEVICES=0,1,4,6 python proof.py
+
+# --- MLX (Apple Silicon) ---
+
+pip install -e ".[mlx]"   # installs mlx + mlx-lm
+
+# Run MLX benchmark
+python benchmark_mlx.py
+python benchmark_mlx.py --max-tokens 2048 --buffer-size 64
+python benchmark_mlx.py --model mlx-community/Qwen3-4B --key-bits 3 --value-bits 4
 ```
 
 ## Test Results
@@ -208,13 +270,14 @@ All 35 tests pass:
 - **Prefill still uses paged cache**: KV cache is allocated at engine init and used during prefill. TQ frees it after. True zero-allocation requires deeper vLLM integration.
 - **Only full-attention layers**: Linear-attention/Mamba layers are not compressed.
 - **Value quantization is the bottleneck**: 2-bit values cause cos_sim=0.94 degradation. Use 4-bit values (cos_sim=0.997) for quality-sensitive workloads.
-- **Hybrid decode dequantizes all history**: During compute, all compressed tokens are expanded to float32. The paper's fused Triton kernels exist but the hybrid path doesn't use them yet.
+- **CUDA hybrid decode dequantizes all history**: On the CUDA path, all compressed tokens are expanded to float32 per decode step. The MLX port solves this with chunked fused decode (online softmax, O(chunk_size) working memory).
 - **MoE models benefit less**: Models with linear-attention layers (Qwen3.5 MoE, Mamba hybrids) have incompressible state that limits TQ's overall impact.
 
 ## Environment
 
 Tested on:
-- vLLM 0.18.0, PyTorch 2.10, CUDA 12.8
-- RTX 5090 (32GB) -- Qwen3.5-27B-AWQ, single GPU
-- 8x RTX 3090 (24GB) -- Qwen3.5-35B-A3B MoE, TP=8
-- Python 3.12
+- **CUDA**: vLLM 0.18.0, PyTorch 2.10, CUDA 12.8, Python 3.12
+  - RTX 5090 (32GB) -- Qwen3.5-27B-AWQ, single GPU
+  - 8x RTX 3090 (24GB) -- Qwen3.5-35B-A3B MoE, TP=8
+- **MLX**: MLX 0.22, mlx-lm, Python 3.11
+  - Apple M3 Pro (18GB) -- Qwen2.5-3B-Instruct-4bit

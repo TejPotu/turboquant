@@ -16,7 +16,7 @@ import mlx.core as mx
 
 
 def get_memory_mb():
-    """Get current unified memory usage in MB."""
+    """Get current active memory usage in MB."""
     try:
         return mx.get_active_memory() / (1024 * 1024)
     except AttributeError:
@@ -27,7 +27,7 @@ def get_memory_mb():
 
 
 def get_peak_memory_mb():
-    """Get peak unified memory usage in MB."""
+    """Get peak memory usage in MB."""
     try:
         return mx.get_peak_memory() / (1024 * 1024)
     except AttributeError:
@@ -48,7 +48,7 @@ def reset_peak_memory():
             pass
 
 
-def generate_text(model, tokenizer, prompt, max_tokens=256, cache=None):
+def generate_and_measure(model, tokenizer, prompt, max_tokens, cache=None):
     """Generate text and measure performance metrics."""
     from mlx_lm.generate import generate_step
     from mlx_lm.models.cache import make_prompt_cache
@@ -59,9 +59,10 @@ def generate_text(model, tokenizer, prompt, max_tokens=256, cache=None):
         cache = make_prompt_cache(model)
 
     reset_peak_memory()
+    gc.collect()
+    mx.clear_cache()
     mem_before = get_memory_mb()
 
-    # Generate
     t0 = time.perf_counter()
     generated_tokens = []
     first_token_time = None
@@ -80,13 +81,13 @@ def generate_text(model, tokenizer, prompt, max_tokens=256, cache=None):
     ttft = first_token_time - t0 if first_token_time else 0.0
     n_tokens = len(generated_tokens)
 
+    gc.collect()
+    mx.clear_cache()
     mem_after = get_memory_mb()
     peak_mem = get_peak_memory_mb()
 
-    # Decode output
     output_text = tokenizer.decode(generated_tokens)
 
-    # Compute metrics
     decode_time = t_total - ttft if n_tokens > 1 else t_total
     decode_tps = (n_tokens - 1) / decode_time if decode_time > 0 and n_tokens > 1 else 0.0
 
@@ -98,15 +99,15 @@ def generate_text(model, tokenizer, prompt, max_tokens=256, cache=None):
         "decode_tps": decode_tps,
         "mem_before_mb": mem_before,
         "mem_after_mb": mem_after,
+        "kv_overhead_mb": mem_after - mem_before,
         "peak_mem_mb": peak_mem,
         "cache": cache,
     }
 
 
-def run_benchmark(model_name, prompts, max_tokens=256, key_bits=3, value_bits=2, buffer_size=128):
-    """Run full benchmark: baseline vs TurboQuant."""
+def run_benchmark(model_name, prompts, max_tokens=256, key_bits=3, value_bits=4, buffer_size=64):
+    """Run full benchmark: baseline vs TurboQuant with fresh models."""
     from mlx_lm import load
-    from mlx_lm.models.cache import make_prompt_cache
 
     print(f"\n{'='*70}")
     print(f"TurboQuant MLX Benchmark")
@@ -115,65 +116,65 @@ def run_benchmark(model_name, prompts, max_tokens=256, key_bits=3, value_bits=2,
     print(f"TQ config: key_bits={key_bits}, value_bits={value_bits}, buffer={buffer_size}")
     print(f"{'='*70}\n")
 
-    # Load model
-    print("Loading model...")
-    model, tokenizer = load(model_name)
-    mx.eval(model.parameters())
-    gc.collect()
-    print(f"Model loaded. Base memory: {get_memory_mb():.1f} MB\n")
-
     results = {"baseline": [], "turboquant": []}
 
     for prompt_name, prompt in prompts:
         print(f"\n--- Prompt: {prompt_name} ---")
         print(f"Input: {prompt[:80]}...")
 
-        # --- Baseline ---
+        # ── Baseline (fresh model) ──
         print("\n[Baseline]")
+        model, tokenizer = load(model_name)
+        mx.eval(model.parameters())
         gc.collect()
-        baseline_cache = make_prompt_cache(model)
-        baseline = generate_text(model, tokenizer, prompt, max_tokens, cache=baseline_cache)
+        mx.clear_cache()
+        base_mem = get_memory_mb()
+
+        baseline = generate_and_measure(model, tokenizer, prompt, max_tokens)
 
         print(f"  TTFT: {baseline['ttft']*1000:.1f} ms")
         print(f"  Decode: {baseline['decode_tps']:.1f} tok/s ({baseline['n_tokens']} tokens)")
-        print(f"  Memory: {baseline['mem_after_mb']:.1f} MB (peak: {baseline['peak_mem_mb']:.1f} MB)")
+        print(f"  KV overhead: {baseline['kv_overhead_mb']:.1f} MB")
+        print(f"  Peak memory: {baseline['peak_mem_mb']:.1f} MB")
         print(f"  Output: {baseline['output'][:120]}...")
 
         results["baseline"].append(baseline)
-
-        # Clear cache
-        del baseline_cache
+        del model, tokenizer
         gc.collect()
+        mx.clear_cache()
 
-        # --- TurboQuant ---
+        # ── TurboQuant (fresh model) ──
         print("\n[TurboQuant]")
+        model, tokenizer = load(model_name)
+        mx.eval(model.parameters())
         gc.collect()
+        mx.clear_cache()
 
-        from turboquant.mlx.integration import make_turboquant_cache, get_stats
-        tq_cache = make_turboquant_cache(
+        from turboquant.mlx.integration import install_turboquant, get_stats
+        tq_cache = install_turboquant(
             model,
             key_bits=key_bits,
             value_bits=value_bits,
             buffer_size=buffer_size,
         )
-        tq = generate_text(model, tokenizer, prompt, max_tokens, cache=tq_cache)
+        tq = generate_and_measure(model, tokenizer, prompt, max_tokens, cache=tq_cache)
 
         stats = get_stats(tq_cache)
         print(f"  TTFT: {tq['ttft']*1000:.1f} ms")
         print(f"  Decode: {tq['decode_tps']:.1f} tok/s ({tq['n_tokens']} tokens)")
-        print(f"  Memory: {tq['mem_after_mb']:.1f} MB (peak: {tq['peak_mem_mb']:.1f} MB)")
+        print(f"  KV overhead: {tq['kv_overhead_mb']:.1f} MB")
+        print(f"  Peak memory: {tq['peak_mem_mb']:.1f} MB")
         print(f"  TQ Stats: {stats['total_compressed_tokens']} compressed, "
               f"{stats['total_buffered_tokens']} buffered, "
               f"{stats['total_mb']:.1f} MB TQ cache")
         print(f"  Output: {tq['output'][:120]}...")
 
         results["turboquant"].append(tq)
-
-        # Clear
-        del tq_cache
+        del model, tokenizer, tq_cache
         gc.collect()
+        mx.clear_cache()
 
-    # --- Summary ---
+    # ── Summary ──
     print(f"\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
@@ -182,20 +183,20 @@ def run_benchmark(model_name, prompts, max_tokens=256, key_bits=3, value_bits=2,
         b = results["baseline"][i]
         t = results["turboquant"][i]
         print(f"\n  {name}:")
-        print(f"    Baseline:    {b['decode_tps']:.1f} tok/s, peak {b['peak_mem_mb']:.1f} MB")
-        print(f"    TurboQuant:  {t['decode_tps']:.1f} tok/s, peak {t['peak_mem_mb']:.1f} MB")
+        print(f"    Baseline:    {b['decode_tps']:.1f} tok/s, KV {b['kv_overhead_mb']:.1f} MB, peak {b['peak_mem_mb']:.1f} MB")
+        print(f"    TurboQuant:  {t['decode_tps']:.1f} tok/s, KV {t['kv_overhead_mb']:.1f} MB, peak {t['peak_mem_mb']:.1f} MB")
 
-        if b['peak_mem_mb'] > 0:
-            mem_ratio = b['peak_mem_mb'] / max(t['peak_mem_mb'], 1)
-            print(f"    Memory ratio: {mem_ratio:.2f}x")
+        if b['kv_overhead_mb'] > 0:
+            mem_ratio = b['kv_overhead_mb'] / max(t['kv_overhead_mb'], 0.1)
+            print(f"    KV compression: {mem_ratio:.1f}x")
         if b['decode_tps'] > 0:
             speed_ratio = t['decode_tps'] / b['decode_tps']
-            print(f"    Speed ratio:  {speed_ratio:.2f}x")
+            print(f"    Speed ratio:    {speed_ratio:.0%}")
 
     return results
 
 
-# --- Default benchmark prompts ---
+# ── Default benchmark prompts ──
 BENCHMARK_PROMPTS = [
     ("factual_qa", (
         "Explain the key differences between TCP and UDP protocols, "
@@ -229,8 +230,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=256, help="Max tokens to generate")
     parser.add_argument("--key-bits", type=int, default=3, help="Key quantization bits (2-4)")
     parser.add_argument("--value-bits", type=int, default=4, help="Value quantization bits (2 or 4)")
-    parser.add_argument("--buffer-size", type=int, default=512,
-                        help="Recent exact token buffer per layer (default 512). "
+    parser.add_argument("--buffer-size", type=int, default=64,
+                        help="Recent exact token buffer per layer (default 64). "
                              "Compression only activates beyond this threshold.")
     args = parser.parse_args()
 
