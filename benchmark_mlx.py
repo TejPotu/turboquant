@@ -16,27 +16,36 @@ import mlx.core as mx
 
 
 def get_memory_mb():
-    """Get current Metal GPU memory usage in MB."""
+    """Get current unified memory usage in MB."""
     try:
-        return mx.metal.get_active_memory() / (1024 * 1024)
-    except Exception:
-        return 0.0
+        return mx.get_active_memory() / (1024 * 1024)
+    except AttributeError:
+        try:
+            return mx.metal.get_active_memory() / (1024 * 1024)
+        except Exception:
+            return 0.0
 
 
 def get_peak_memory_mb():
-    """Get peak Metal GPU memory usage in MB."""
+    """Get peak unified memory usage in MB."""
     try:
-        return mx.metal.get_peak_memory() / (1024 * 1024)
-    except Exception:
-        return 0.0
+        return mx.get_peak_memory() / (1024 * 1024)
+    except AttributeError:
+        try:
+            return mx.metal.get_peak_memory() / (1024 * 1024)
+        except Exception:
+            return 0.0
 
 
 def reset_peak_memory():
     """Reset peak memory counter."""
     try:
-        mx.metal.reset_peak_memory()
-    except Exception:
-        pass
+        mx.reset_peak_memory()
+    except AttributeError:
+        try:
+            mx.metal.reset_peak_memory()
+        except Exception:
+            pass
 
 
 def generate_text(model, tokenizer, prompt, max_tokens=256, cache=None):
@@ -213,12 +222,16 @@ def main():
     parser.add_argument(
         "--model",
         default="mlx-community/Qwen2.5-3B-Instruct-4bit",
-        help="Model name or path (default: mlx-community/Qwen2.5-3B-Instruct-4bit)",
+        help="Model name or path (default: mlx-community/Qwen2.5-3B-Instruct-4bit). "
+             "NOTE: TurboQuant targets models >=3B with head_dim>=128 for best quality. "
+             "Smaller models like 0.5B with head_dim=64 will show quality degradation.",
     )
     parser.add_argument("--max-tokens", type=int, default=256, help="Max tokens to generate")
-    parser.add_argument("--key-bits", type=int, default=3, help="Key quantization bits")
-    parser.add_argument("--value-bits", type=int, default=2, help="Value quantization bits")
-    parser.add_argument("--buffer-size", type=int, default=128, help="Ring buffer size")
+    parser.add_argument("--key-bits", type=int, default=3, help="Key quantization bits (2-4)")
+    parser.add_argument("--value-bits", type=int, default=4, help="Value quantization bits (2 or 4)")
+    parser.add_argument("--buffer-size", type=int, default=512,
+                        help="Recent exact token buffer per layer (default 512). "
+                             "Compression only activates beyond this threshold.")
     args = parser.parse_args()
 
     run_benchmark(

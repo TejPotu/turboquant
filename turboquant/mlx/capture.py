@@ -12,12 +12,11 @@ if TYPE_CHECKING:
 
 
 class RingBuffer:
-    """Fixed-size ring buffer for recent exact KV tokens."""
+    """Fixed-size ring buffer for recent exact KV tokens.
 
-    __slots__ = (
-        "capacity", "num_kv_heads", "head_dim", "dtype",
-        "_k", "_v", "_pos", "_total_written",
-    )
+    Stores the most recent ``capacity`` tokens in bf16/fp16.
+    When full, the oldest chunk is returned for compression.
+    """
 
     def __init__(
         self,
@@ -31,9 +30,10 @@ class RingBuffer:
         self.head_dim = head_dim
         self.dtype = dtype
 
-        self._k = mx.zeros((capacity, num_kv_heads, head_dim), dtype=dtype)
-        self._v = mx.zeros((capacity, num_kv_heads, head_dim), dtype=dtype)
-        self._pos = 0
+        # Use a simple list-based deque: append new, trim old
+        self._k_parts: list[mx.array] = []
+        self._v_parts: list[mx.array] = []
+        self._pos = 0       # total tokens in buffer
         self._total_written = 0
 
     @property
@@ -48,91 +48,67 @@ class RingBuffer:
     def total_written(self) -> int:
         return self._total_written
 
+    def _get_all(self) -> Optional[tuple[mx.array, mx.array]]:
+        """Concatenate all parts into a single tensor."""
+        if not self._k_parts:
+            return None
+        if len(self._k_parts) == 1:
+            return self._k_parts[0], self._v_parts[0]
+        k = mx.concatenate(self._k_parts, axis=0)
+        v = mx.concatenate(self._v_parts, axis=0)
+        self._k_parts = [k]
+        self._v_parts = [v]
+        return k, v
+
     def write(
         self, key: mx.array, value: mx.array, num_tokens: int
     ) -> Optional[tuple[mx.array, mx.array]]:
-        """Append tokens. Returns (overflow_k, overflow_v) if buffer overflows."""
-        overflow_k_parts = []
-        overflow_v_parts = []
+        """Append tokens. Returns (overflow_k, overflow_v) if buffer overflows.
 
-        offset = 0
-        remaining = num_tokens
-
-        while remaining > 0:
-            space = self.capacity - self._pos
-            if space <= 0:
-                overflow_k_parts.append(self._k[:self._pos])
-                overflow_v_parts.append(self._v[:self._pos])
-                self._pos = 0
-                space = self.capacity
-
-            n = min(remaining, space)
-            self._k = mx.concatenate([
-                self._k[:self._pos],
-                key[offset:offset + n],
-                self._k[self._pos + n:],
-            ], axis=0) if self._pos + n < self.capacity else mx.concatenate([
-                self._k[:self._pos],
-                key[offset:offset + n],
-            ], axis=0)
-            # Simpler approach: use index update
-            # MLX doesn't have in-place index assignment, so we rebuild
-            new_k = mx.zeros_like(self._k)
-            new_v = mx.zeros_like(self._v)
-            if self._pos > 0:
-                new_k = self._k  # keep existing
-                new_v = self._v
-            # Write slice
-            indices = mx.arange(self._pos, self._pos + n)
-            # Since MLX doesn't support slice assignment, we use scatter-like approach
-            # For simplicity, reconstruct from parts
-            parts_k = []
-            parts_v = []
-            if self._pos > 0:
-                parts_k.append(self._k[:self._pos])
-                parts_v.append(self._v[:self._pos])
-            parts_k.append(key[offset:offset + n])
-            parts_v.append(value[offset:offset + n])
-            remaining_slots = self.capacity - self._pos - n
-            if remaining_slots > 0:
-                parts_k.append(mx.zeros((remaining_slots, self.num_kv_heads, self.head_dim), dtype=self.dtype))
-                parts_v.append(mx.zeros((remaining_slots, self.num_kv_heads, self.head_dim), dtype=self.dtype))
-            self._k = mx.concatenate(parts_k, axis=0)
-            self._v = mx.concatenate(parts_v, axis=0)
-
-            self._pos += n
-            offset += n
-            remaining -= n
-
+        key/value: (num_tokens, num_kv_heads, head_dim)
+        """
+        self._k_parts.append(key[:num_tokens])
+        self._v_parts.append(value[:num_tokens])
+        self._pos += num_tokens
         self._total_written += num_tokens
 
-        if overflow_k_parts:
-            return (
-                mx.concatenate(overflow_k_parts, axis=0),
-                mx.concatenate(overflow_v_parts, axis=0),
-            )
+        if self._pos > self.capacity:
+            # Flush: materialize and split
+            kv = self._get_all()
+            if kv is None:
+                return None
+            k_all, v_all = kv
+            overflow_n = self._pos - self.capacity
+            overflow_k = k_all[:overflow_n]
+            overflow_v = v_all[:overflow_n]
+            self._k_parts = [k_all[overflow_n:]]
+            self._v_parts = [v_all[overflow_n:]]
+            self._pos = self.capacity
+            return overflow_k, overflow_v
+
         return None
 
     def drain(self) -> Optional[tuple[mx.array, mx.array]]:
         """Return all buffered tokens and reset."""
         if self._pos == 0:
             return None
-        k = self._k[:self._pos]
-        v = self._v[:self._pos]
+        kv = self._get_all()
+        self._k_parts.clear()
+        self._v_parts.clear()
         self._pos = 0
-        return k, v
+        return kv
 
     def peek(self) -> Optional[tuple[mx.array, mx.array]]:
         """Read current buffer contents without draining."""
         if self._pos == 0:
             return None
-        return self._k[:self._pos], self._v[:self._pos]
+        return self._get_all()
 
     def reset(self):
+        self._k_parts.clear()
+        self._v_parts.clear()
         self._pos = 0
         self._total_written = 0
-        self._k = mx.zeros((self.capacity, self.num_kv_heads, self.head_dim), dtype=self.dtype)
-        self._v = mx.zeros((self.capacity, self.num_kv_heads, self.head_dim), dtype=self.dtype)
 
 
 class KVCaptureEngine:
